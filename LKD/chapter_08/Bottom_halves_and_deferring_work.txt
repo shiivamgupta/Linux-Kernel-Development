@@ -1,0 +1,324 @@
+1. Bottom halves:
+• Managing interrupts is divided into two parts; i) The first part, interrupt handlers are executed by the kernel asynchronously in immediate response to a hardware interrupt; ii) The second part, bottom halves is to perform any interrupt-related work not performed by the ISR.
+
+• A couple of useful tips in deciding how to divide the work between the two parts:
+i)   If the work is time sensitive, perform it in the interrupt handler;
+ii)  If the work is related to the hardware, perform it in the interrupt handler;
+iii) If the work needs to ensure that another interrupt (particularly the same interrupt) does not interrupt it, perform it in the interrupt handler;
+iv)  For everything else, consider performing the work in the bottom half.
+
+• Why bottom halves?
+Because interrupt handlers run with the current interrupt line disabled on all processors, and even worse if IRQF_DISABLED is set, all interrupt lines on the current processor are disabled + current interrupt line disabled on all processors. 
+The point of a bottom half is not to do work at some specific point in the future, but simply to defer work until any point in the future when the system is less busy and interrupts again enabled. Often the bottom halves run immediately after the interrupt returns. The key is that they run with all interrupts enabled.
+
+• The history of bottom halves:
+i)   The original "Bottom Half" (BH):
+No two BHs could run at the same time, even on different processors.
+ii)  Task Queues:
+The kernel defines a family of queues, each queue contained a linked list of functions to call. The queued functions were run at certain times, depending on which queue they were in. Drivers could register their bottom halves in the appropriate queue. 
+iii) Softirqs and Tasklets:
+Softirqs are a set of statically defined bottom halves that can run simultaneously on any processor, even two of the same types can run concurrently. Tasklets, which has nothing to do with tasks, are flexible and dynamically created bottom halves built on softirqs. Two different tasklets can run concurrently on different processors, but tasklets of the same type couldn't cannot run simultaneously. So tasklet is a good tradeoff between performance and ease of use.
+Softirqs are useful when performance is critical, such as networking. Softirqs must be registered statically at compile time, but tasklets are dynamically registered.
+iv)  Work Queues:
+Work queues are a simple but useful method of queueing work to be later performed in process context.
+v)   Kernel timers:
+Another mechanism for deferring work is kernel timers. But unlike the previous methods, timers defer work for a specified amount of time. Thus timers defer work until at least a specific time has elapsed, the above methods defer work to any time but now.
+
+• Bottom halves:
+BH              removed in 2.5
+Task Queues     removed in 2.5
+Softirq         available since 2.3
+Tasklet         available since 2.3
+Work queues     available since 2.5
+
+2. Softirqs:
+Softirqs are rarely used directly, tasklets are a much more common form of bottom half, the softirq source code lives in kernel/softirq.c.
+• implementing softirqs:
+softirqs are represented by the softirq_action structure, which is defined in <linux/interrupt.h>:
+struct softirq_action
+{
+	void (*action)(struct softirq_action*);
+};
+A 32-entry array of this structure is declared in kernel/softirq.c:
+static struct softirq_action softirq_vec[NR_SOFTIRQS];
+The kernel enforces a limit of 32 registered softirqs, however in the current kernel, only 9 exists.
+• The softirq handler:
+The prototype of a softirq handler:
+void softirq_handler(struct softirq_action*);
+A softirq never preempts another softirq, the only event that can preempt a softirq is an interrupt handler. Another softirq, even the same one, can run on another processor.
+• Executing softirqs:
+A registered softirq must be marked before it will execute, this is called raising the softirq. Usually, the ISR marks its softirq for execution before returning, then at a suitable time, the softirq runs. Pending softirqs are checked for and executed in the following places:
+i)   In the return from hardware interrupt code path;
+ii)  In the ksoftirqd kernel thread;
+iii) In any code that explicitly checks for and executes pending softirqs, such as the network subsystem.
+==========================================
+u32 pending;
+
+pending = local_softirq_pending();
+if(pending)
+{
+	struct softirq_action* h;
+	/* reset the pending bitmask */
+	set_softirq_pending(0);
+
+	h = softirq_vec;
+	do{
+		if(pending & 1)
+			h->action(h);
+		h++;
+		pending >>= 1;
+	}while(pending);
+}
+==========================================
+This snippet is the heart of softirq processing:
+pending is a 32-bit mask of pending softirqs, after it is got from local_softirq_pending(), it could be cleared. (This actually should be done with local interrupts disabled, because if interrupts were not disabled, a softirq could have been raised(and thus be pending) in the intervening time between saving the mask and cleaning it.) while here's a pending softirq, loop over pending bit mask, and execute its handler. (at most loops 32 times.)
+
+• Using softirqs:
+Softirqs are reserved for the most timing-critical and important bottom half processing. Currently only two subsystems - network and block devices directly use softirqs. Additionally, kernel timers and tasklets are built on top of softirqs.
+i)   Assigning an index:
+Softirq is declared statically at compile time via an enum in <linux/interrupt.h>. The kernel uses this index which starts from 0, as relative priority. Softirqs with lower index execute before those with higher indexes.
+Creating a softirq includes adding an entry in the enum, but not simply adding at the end of the enum, because here's a relative priority. But by convention, HI_SOFTTRQ is always the first entry and RCU_SOFTIRQ is always the last entry. A new entry likely belongs in between BLOCK_SOFTIRQ and TASKLET_SOFTIRQ.
+ii)  Registering the handler:
+Softirq handler is registered at run-time via open_softirq(), which takes 2 parameters: the softirq's index and its handler function. For example:
+open_softirq(NET_TX_SOFTIRQ, net_tx_action);
+The softirq handlers run with interrupts enabled and cannot sleep. While a softirq handler runs, softirqs on the current processor are disabled (so softirq couldn't preempt itself!), another processor, however, can execute other softirqs. Because two softirq handlers of the same type could be executed at the same time, so proper locking is required for global data used in softirq handler. If softirq uses a lock to prevent another instance of itself from running simultaneously, there would be no reason to use softirq. Consequently, softirqs handlers resort to per-processor data and other tricks to avoid explicit locking.
+iii) Raising the softirqs:
+Calling raise_softirq(softirq_index) to mark it pending, so it could run at the next invocation of do_softirq(). This function disables interrupts prior to actually raising the softirq and then restores them to their previous state. If the interrupts are already off, the function raise_softirq_irqoff(softirq_index) could be used as a small optimization.
+Softirqs are most often raised from within interrupt handlers. So ISR performs the basic hardware-related work; raises the softirq; and then exits.
+
+3. Tasklets:
+Tasklets are similar in nature and behavior to softirqs, but they have a simpler interface and relaxed locking rules. Softirqs are required only for high frequency and highly threaded uses. Tasklets are used most widely.
+
+• Implementing tasklets:
+Tasklets are implemented by two softirqs: HI_SOFTIRQ and TASKLET_SOFTIRQ. Tasklets are represented by the tasklet_struct structure, it is declared in <linux/interrupt.h>:
+struct tasklet_struct{
+	struct tasklet_struct* next;  	/* next tasklet in list */
+	unsigned long state;			/* state of the tasklet */
+	atomic_t count;					/* reference counter */
+	void (*func)(unsigned long);	/* tasklet handler function */
+	unsigned long data;				/* argument to the tasklet function */
+};
+The state member is exactly 0, TASKLET_STATE_SCHED (denotes a tasklet that is scheduled to run), TASKLET_STATE_RUN (denotes a tasklet that is running). And TASKLET_STATE_RUN is used only on multiprocessor machines.
+The count member is used as a reference count for the tasklet. If it is nonzero, the tasklet is disabled and cannot run; if it is zero, the tasklet is enabled and can run if marked pending.
+
+• Scheduling tasklets:
+Scheduled tasklets (the equivalent of raised softirqs) are stored in two per-processor structures: tasklet_vec(for regular tasklets) and tasklet_hi_vec(for high-priority tasklets). Both of these structures are linked-list of tasklet_struct structures. 
+Tasklets are scheduled by tasklet_schedule() and tasklet_hi_schedule(), which receive a pointer to the tasklet's tasklet_struct as their sole argument. How tasklet_schedule() works:
+i)   Check whether the tasklet's state is TASKLET_STATE_SCHED, if it is, then the tasklet is already scheduled to run and the function immediately returns.
+ii)  Call __tasklet_schedule().
+iii) Save the state of the interrupt system and then disable local interrupts. This ensures that nothing on this processor will mess with the tasklet code while tasklet_schedule() is manipulating the tasklets.
+iv)  Add the tasklet to be scheduled to the tail of the tasklet_vec (tasklet_hi_vec) linked list, which is unique to each processor. (So tasklet functions are executed in the order they are inserted into the list. (from head to tail), also see: http://lwn.net/Articles/269072/)
+v)   Raise the TASKLET_SOFTIRQ or HI_SORTIRQ so do_softirq() executes this tasklet in the near future.
+vi)  Restore interrupts to their previous state and return.
+
+do_softirq() executes the associated handlers: tasklet_action() and tasklet_hi_action(), these handlers are the heart of tasklet processing. (open_softirq(TASKLET_SOFTIRQ, tasklet_action); open_softirq(HI_SOFTIRQ, tasklet_hi_action); ) What these handlers do:
+i)    Disable local interrupt delivery (there's no need to save the state because the code here is always called as a softirq handler, so interrupts are always enabled.) and receive the tasklet_vec or tasklet_hi_vec list for this processor.
+ii)   Clear this list by setting it to NULL.
+iii)  Enable local interrupt delivery.
+iv)   Loop over each pending tasklet in the retrieved list.
+v)    If this is a multi-processor machine, check whether the tasklet is running on another processor by checking TASKLET_STATE_RUN flag. If it is currently running, do not execute it now and skip to the next pending tasklet. (Only one tasklet of the same type could run at a time.)
+vi)   If the current tasklet is not running, set TASKLET_STATE_RUN flag so another processor would not run it.
+vii)  Check the count, if it is nonzero then the tasklet is disabled and skip it, go to the next pending tasklet.
+viii) Run the tasklet handler.(Since we now know that the tasklet is not running elsewhere, and is marked as running, and has a zero count(enabled), so we could execute its handler)
+ix)   After the tasklet runs, clear the TASKLET_STATE_RUN flag.
+x)    Repeat for the next pending tasklet, until there're no more scheduled tasklets waiting to run.
+
+• Using tasklets:
+i)   Declaring the tasklet:
+TAsklets could be created statically or dynamically:
+DECLARE_TASKLET(name, func, data) macro (sets count to 0) and DECLARE_TASKLET_DISABLED(name, func, data) macro (sets count to 1):
+DECLARE_TASKLET(my_tasklet, my_tasklet_handler, dev) is equivalent to:
+struct tasklet_struct my_tasklet = {NULL, 0, ATOMIC_INIT(0), my_tasklet_handler, dev};
+
+If already have a tasklet_struct, could initialize it using:
+tasklet_init(p_tasklet_struct, tasklet_handler, dev);
+
+ii)  Writing the tasklet handler:
+The tasklet handler must match the following prototyte:
+void tasklet_handler(unsigned long data);
+As with softirqs, tasklets cannot sleep, so you cannot use semaphores or other blocking functions in a tasklet. Tasklets also run with all interrupts enabled. If your tasklet shares data with other tasklet or softirq, you need to use proper locking.
+ 
+iii) Scheduling the tasklet:
+tasklet_schedule(&my_tasklet);  /* mark my_tasklet pending */
+As an optimization, a tasklet always runs on the processor that scheduled it - making better use of the processor cache.
+
+iv) Disabling/Enabling tasklets:
+A tasklet could be disabled by calling tasklet_disable(&my_tasklet). If the tasklet is currently running, this function would not return until the tasklet finishes the execution. Alternatively, tasklet_disable_nosync(&my_tasklet) disables the tasklet but doesn't block.
+tasklet_enable(&my_tasklet); enables the tasklet.
+tasklet_kill(&my_tasklet) removes the tasklet from the pending queue. It first waits for the tasklet to finish the execution and then removes it from the pending queue. This function must not be used in interrupt context because it sleeps. Removing a scheduled tasklet from the queue is useful when dealing with a tasklet that often reschedules itself. And nothing stops some other code from rescheduling the tasklet again, of course.
+
+• ksoftirqd:
+Softirq and tasklet processing is aided by a set of per-processor kernel threads, these kernel threads help in the processing of softirqs when the system is overwhelmed with softirqs. 
+Softirqs might be raised at high rates, and further, softirqs can reactivate themselves. So the possibility of a high frequency of softirqs in conjunction with their capability to remark themselves active can result in user-space programs being starved.
+The 1st solutiuon is simply to keep processing softirqs as they come in and to recheck and reprocess any pending softirqs before returning. This ensures that the kernel processes softirqs in a timely manner. But the user-space is neglected.
+The 2nd solution is not to handle reactivated softirqs. On return from interrupt, the kernel merely looks at all pending softirqs and executes them as normal. If any softirq reactivates itself, they will not run until the next time the kernel handles pending softirqs. But although this method prevents starving user-space, it does starve the softirqs and does not take good advantage of an idle system.
+The 3rd solution, not immediately process reactivated softirqs, but if the number of softirqs grows excessive, the kernel wakes up a family of kernel threads to handle the load. The kernel thread runs with the lowest priority (nice 19), which ensures that they do not run in lieu of something important. This method prevents heavy softirqs from starving user-space, and it also ensures the "excess" softirqs do run eventually. And this solution has the added property that on an idle system the softirqs are handled rather quickly because the kernel threads will schedule immediately.
+
+There is one thread per processor, with the name of ksoftirqd/n where n is the processor number. These kernel threads run a tight loop similar to this:
+=============================================
+for(;;)
+{
+	if(!softirq_pending(cpu))
+		schedule();
+	set_current_state(TASK_RUNNING);
+	while(softirq_pending(cpu))
+	{
+		do_softirq();
+		if(need_reschedule())
+			schedule();
+	}
+	set_current_state(TASK_INTERRUPTIBLE);
+}
+=============================================
+If any softirqs are pending, ksoftirqd calls do_softirq() to handle them. Notice that it does this repeatedly to handle any reactivated softirqs, too. After each iteration, schedule() is called if needed, to enable more important processes to run. After all processing is complete, the kernel thread sets itself TASK_INTERRUPTIBLE and invokes the scheduler to select a new runnable process.
+
+The softirq kernel threads are awakened whenever do_softirq() detects an executed kernel thread reactivating itself.
+
+• The old BH mechanism:
+Each BH must be statically defined and there are a maximum of 32. Because the handlers must be defined in compile time, modules could not directly use the BH interface.
+All BH handlers are strictly serialized, no two BH handlers, even of different types, can run concurrently.
+make_bh() passes in the BH number and makes it pending, and this in turn scheduled the BH handlers bh_action() to run.
+
+4. Work Queues:
+Work queues defer work into a kernel thread, this bottom half always runs in process context; so work queues are schedulable and can therefore sleep. It's easy to decide between using work queues and softirq/tasklet: If deferred work needs to sleep, work queues are used; otherwise, softirqs/tasklets are used.
+If you need a scheduable entity to perform your bottom-half processing, you need work queues. They're the only bottom-half mechanisms that run in process context, and thus the only ones that can sleep. This means that they're useful for situations in which you need to i) allocate a lot of memory; ii) obtain a semaphore; iii) perform block I/O.
+
+• Implementing work queues:
+In its most basic form, the work queue subsystem is an interface for creating kernel threads to handle work queued from elsewhere. These kernel threads are called worker threads. The default worker threads are called "events/n" where n is the processor number, there's one events kernel thread per processor. Unless a driver or subsystem has a strong requirement for creating its own thread, the default thread is preferred. 
+But nothing stops code from creating its own worker thread. Processor-intense and performance-critical work might benefit from its own thread. This also lightens the load on the default threads, which prevents starving the rest of the queued work.
+
+• Data structures representing the type of (multiple) kernel threads: (defined in kernel/workqueue.c)
+=================================================
+struct workqueue_struct
+{
+	struct cpu_workqueue_struct cpu_wq[NR_CPUS];  /* one per processor in the system */
+	struct list_head list;
+	const char* name;
+	int singlethread;
+	int freezeable;
+	int rt;
+};
+
+struct cpu_workqueue_struct
+{
+	spinlock_t lock;                        /* lock protecting this structure */
+	struct list_head worklist;              /* list of work */
+	wait_queue_head_t more_work;
+	struct work_queue* current_struct;
+	struct workqueue_struct* wq;            /* associated workqueue struct */
+	task_t* thread;                         /* associated thread */
+};
+==================================================
+Note that each type of worker thread has one workqueue_struct associated to it. Inside, there's one cpu_workqueue_struct for each processor. There is one worker thread of that type on each processor.
+
+• Data structures representing one specific work: (defined in <linux/workqueue.h>)
+All worker threads are implemented as normal kernel threads running the worker_thread() function. Each work is represented by the following structure:
+=============================
+struct work_struct
+{
+	atomic_long_t data;
+	struct list_head entry;
+	work_func_t func;
+};
+=============================
+These structures are strung into a linked list, one for each type of queue on each processor.
+
+The heart of worker_thread():
+=================================================================
+for(;;)
+{
+	prepare_to_wait(&cwq->more_work, &wait, TASK_INTERRUPTIBLE);
+	if(list_empty(&cwq->worklist))
+		schedule();
+	finish_wait(&cwq->more_work, &wait);
+	run_workqueue(cwq);
+}
+=================================================================
+i)   The thread marks itself sleeping (its state is set to TASK_INTERRUPTIBLE and adds itself to a wait queue);
+ii)  If the linked list is empty, the thread calls schedule() and goes to sleep;
+iii) If the list is non-empty, the thread doesn't go to sleep; instead it marks itself as TASK_RUNNING and removes itself from the wait queue.
+iv)  If the list is non-empty, the thread calls run_workqueue() to perform the deferred work. run_workqueue() performs the following work:
+=======================================================================
+while(!list_empty(&cwq->worklist))
+{
+	struct work_struct* work;
+	work_func_t f;
+	void* data;
+
+	work = list_entry(cwq->worklist.next, struct work_struct, entry);
+	f = work->func;
+	list_del_init(cwq->worklist.next);
+	work_clear_pending(work);
+	f(work);
+}
+=======================================================================
+i)   While the list is not empty, it grabs the next entry in the list;
+ii)  It retrieves the function that should be called and its data;
+iii) It removes the entry from the list and clears the pending bit in the structure itself;
+iv)  It invokes the function; and then repeat.
+
+• Work queue implementation summary:
+At the highest level, there're worker threads. There can be multiple types of worker threads, and there's one worker thread per processor of a given type. Kernel can create worker threads as needed, and by default there's the events/n worker thread. Each worker thread is represented by the cpu_workqueue_struct structure. The workqueue_struct structure represents all the worker threads of a given type. The work_struct structure represents a work, this structure contains a pointer to the function that handles the deferred work. The work is submitted to a specific worker thread.
+
+• Using work queues:
+i)   Creating work:
+The 1st step is to create some work to defer. To create the structure statically at runtime: DECLARE_WORK(name, void (*func)(struct work_struct *)); this statically creates a work_struct structure named name with handler function func. If already have the work_struct structure, using: INIT_WORK(struct work_struct* work, void (*func)(struct work_struct *));
+
+ii)  The work queue handler:
+The prototype for the work queue handler is:
+void work_handler(void* data);
+The handler runs in process context and could sleep. By default, interrupts are enabled and no locks are held. Note that despite running in process context, the work handlers cannot access user-space memory because there's no associated user-space user-space memory map for kernel threads. (The kernel can access user-space memory only when running on behalf of a user-space process, such as executing a syscall. Only then is user-space memory mapped in.)
+Locking between work queues and other parts of kernel is handled just as with any other process context code.
+
+iii) Scheduling the work:
+To queue a given work's handler function with the default events worker thread, simply call:
+schedule_work(&work); The work is scheduled immediately and is run as soon as the events worker thread on the current processor wakes up.
+Sometimes you do not want the work to execute immediately, but instead after some delay:
+schedule_delayed_work(&work, delay); In this case, the work will not execute for at least delay timer ticks into the future.
+
+iv)  Flushing work:
+Sometimes you need to ensure that a given batch of work has completed before continuing. This is especially important for modules, which almost certainly want to call this function before unloading. Other places in the kernel want to make sure that no work is pending to prevent race conditions.
+void flush_scheduled_work(void); // to flush a given work queue.
+This function waits until all entries in the queue are executed before returning. While waiting for any pending work to execute, the function sleeps. Therefore it could only be called from process context.
+Note that this function does not cancel any delayed work. That is, any work that was scheduled via schedule_delayed_work() and whose delay is not up yet, is not flushed via flush_scheduled_work(). To cancel the delayed work, call:
+int cancel_delayed_work(struct work_struct* work);
+This function cancels the pending work, if any, associated with the given work_struct. 
+
+v)   Creating new work queues:
+If the default queue is insufficient for your needs, you can create a new work queue and corresponding worker threads.
+struct workqueue_struct* create_workqueue(const char* name);
+name is used to name the kernel threads; e.x.:
+==========================================
+struct workqueue_struct* keventd_wq;
+keventd_wq = create_workqueue("events");
+==========================================
+This function creates all the worker threads (one for each processor in the system) and prepares them to handle work.
+
+The following functions are analogous to schedule_work() and schedule_delayed_work(), except that they work on the given work queue and not the default events queue:
+int queue_work(struct workqueue_struct* wq, struct work_struct* work);
+int queue_delayed_work(struct workqueue_struct* wq, struct work_struct* work, unsigned long delay);
+
+You can flush a wait queue via a call to the function:
+flush_workqueue(struct workqueue_struct* wq);
+As previously discussed, this function works identically to flush_scheduled_work(), except that it waits for the given queue to empty before returning.
+
+5. Which bottom half should I use?
+Bottom Half     Context      Inherent Serialization
+Softirq         Interrupt    None
+Tasklet         Interrupt    Against the same tasklet
+Work queues     Process      None (scheduled as process context)
+
+6. Locking between the bottom halves:
+i)  If process context code and a bottom half share data, you need to disable bottom-half processing and obtain a lock before accessing the data. Doing both ensures local and SMP protection and prevents a deadlock.
+ii) If interrupt context code and a bottom half share data, do the same as above to ensure local and SMP protection and prevents a deadlock.
+
+7. Disabling bottom halves:
+More often, to safely protect shared data, you need to obtain a lock and disable bottom halves.
+
+void local_bh_disable(); // disable all softirq and tasklet processing on the local processor
+void local_bh_enable(); // enable ......
+
+The calls can be nested - only the final call to local_bh_enable() actually enables bottom halves. The functions accomplish this by maintaining a per-task counter via the preempt_count (the same counter used by kernel preemption.) When the counter reaches 0, bottom halves processing is possible. Because bottom halves are disabled, local_bh_enable() also checks for any pending bottom halves and executes them.
+
+The functions are unique to each supported architecture and are usually written as complicated macros in <asm/softirq.h>.
+These calls do not disable the execution of work queues, because work queues run in process context, there are no issue with asynchronous execution, and thus, there's no need to disable them. Because softirqs and tasklets can occur asynchronously, kernel code may need to disable them. With work queues, protecting shared data is the same as in any process context.

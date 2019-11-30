@@ -1,0 +1,85 @@
+1. Syscalls:
+For example, the syscall getpid(), the implementation in the kernel is simple:
+SYSCALL_DEFINE0(getpid)
+{
+	return task_tgid_vnr(current); // return current->tgid
+}
+SYSCALL_DEFINE0 is simply a macro that defines a system call with no parameters. The expanded code looks like this:
+asmlinkage long sys_getpid(void);
+i)   asmlinkage is a directive to tell the compiler to look only on the stack for this function's argument. This is a required modifier for all system calls.
+ii)  System calls defined to return an int in user-space return a long in the kernel. (For compability)
+iii) Naming convention: syscall bar() is implemented in the kernel as function sys_bar().
+
+• System call numbers:
+If a system call is removed, its system call number can't be recycled, Linux provides a "not implemented" system call: sys_ni_syscall(), which does nothing except return -ENOSYS. 
+The kernel keeps a list of all registered system calls in the system call table, stored in system_call_table. This table is explicitly defined for each architecture, on x86-64 it is defined in arch/x86/kernel/syscall_64.c. This table assigns each valid syscall to a unique syscall number.
+
+2. System call handler:
+User-space application must signal the kernel that it wants to execute a syscall and have the system to switch to kernel mode, where the system call can be executed in kernel-space by the kernel on behave of the application. The mechanism to signal kernel is a software interrupt: on x86 is interrupt number 128 (int $0x80). It triggers a switch to kernel mode and the execution of exception vector 128, which is the system call handler, in Linux the system call handler has the name: system_call(). On x86-64 it is implemented in entry_64.S. (Recently, x86 processor adds a feature known as sysenter, it provides a faster, more specialized way of trapping into kernel to execute a syscall than using the int interrupt instruction.)
+
+• Denoting the correct system call:
+system_call() checks the validity of the given system call number by comparing it to NR_syscalls; if it's larger than or equal to NR_syscalls, the function returns -ENOSYS, otherwise, the specified system call is invoked: call *sys_call_table(, %rax, 8).
+
+			Invoking the system call handler and executing a system call
+=========================================================================================
+|                                                                                       |
+|   ------------------    ------------------------    -------------------------         |
+|   ↑(1)             ↓    ↑(2)                   ↓    ↑	(3)                   ↓ (4)     |                     
+|call read()      read() wrapper                 system_call()             sys_read()   |
+|   ↑(7)             ↓    ↑(6)                   ↓    ↑ (5)                   ↓         |
+|   ------------------    ------------------------    -------------------------         |
+| Application     C library read()               Syscall handler           sys_read()   |
+|                   wrapper                                                             |
+|                                                                                       |
+|                User-space                                 Kernel-space                |
+|                                                                                       |
+=========================================================================================
+
+• Parameter passing:
+On X86-32, the registers %ebx, %ecx, %edx, %esi, %edi contain the first 5 parameters. If six or more arguments, a single register holds a pointer to the user-space where all the parameters are stored.
+Return value is sent to user-space via register. On x86, it's writen to %eax.
+
+3. System call implementation:
+• Implementing system call:
+The syscall should have exactly one purpose, should have a clean and simple interface with the smallest number of arguments possible. Be forward thinking. Many systems provide a flag argument to address forward compatibility, used as a switch to enable new functionality without breaking backward compatibility. Unix motto: "Provide mechanism, not policy."
+
+• Verifying the parameters:
+System calls must carefully verify all their parameters to ensure that they are valid and legal.
+One of the most important checks is the validity of any pointer that the user provides. Before following a pointer into user-space, the system must ensure that:
+i)   The pointer points to a region of memory in user-space. (Processes must not be able to trick the kernel into reading data in kernel-space on their behalf.)
+ii)  The pointer points to a region of memory in the process's address space. (The processes mustn't trick the kernel to read someone else's data.)
+iii) The process must not be able to bypass memory access restrictions. (If reading, the memory is marked readable, if writing, marked writable, if executing, marked executable.)
+
+Kernel provides 2 methods for performing requisite check and the desired copy to and from user-space.
+i)  For writing to user-space, the method copy_to_user() is provided;
+ii) For reading from user-space, the method copy_from_user() is provided.
+Both copy_to_user() and copy_from_user() may block. This could occur, for example, if the page containing the user data is not in physical, then it must wait until page fault handler brings the page back into memory. (Defined/Declared in <asm/uaccess.h>, along with get_user(), put_user(), etc.)
+
+A final possible check is for valid permission. A call to capable() with a valid capabilities flag returns nonzero if the caller holds the specified capability, and zero otherwise.
+
+4. System call context:
+Kernel is in process context during the execution of a syscall. In process context, kernel is capable of sleeping (e.x. if the syscall blocks on a call or explicitly calls schedule().) and is fully preemptible. These 2 points are important.
+i)   The capability of sleep means that system calls can make use of the majority of the kernel's functionality. (However interrupt handlers cannot sleep and thus are much more limited in what they can do than system calls running in process context.)
+ii)  Process context is preemptible means that: because the new task may execute the same system call, so system calls must be reentrant.
+iii) When the syscall returns, control continues in system_call(), which ultimately switches to user-space and continues the execution of the user process.
+
+5. Final steps in binding a system call:
+i)   Add an entry to the end of the system call table, this needs to be done for each architecture that supports the syscall. The position of the syscall in the table starting at 0, is its syscall number. (The syscall doesn't need to receive the same syacall number under each architecture, as the syscall number is part of the architecture's unique ABI)
+ii)  For each supported architecture, define the syscall number in <asm/unistd.h>
+iii) Compile the syscall into the kernel image. This can be as simple as putting the syscall in a relevant file in kernel/, such as sys.c, which is home to miscellaneous syscalls.
+
+6. Accessing the syscall from user-space:
+Linux provides a set of macros for wrapping access to syscalls. It sets up the register contents and issues the trap instructions. These macros are named _syscalln(), where n is between 0 and 6. For example: consider the syscall open() is defined as:
+long open(const char* filename, int flags, int mode);
+The syscall macro to use this syscall without explicit library support would be: 
+
+#define __NR_open 5
+_syscall3(long, open, const char*, filename, int, flags, int, mode);
+
+For each macro there're 2 + 2*n parameters. The __NR_open define is in <asm/unistd.h>, it's the syscall number. the _syscall3 macro expands into a C function with inline assembly, which performs the steps discussed in the previous section: pushing the syscall number and parameters into the correct registers and issue the software interrupt to trap into the kernel. 
+Placing this macro in an application is all that is required to use the open() syscall.
+
+7. Alternatives to syscalls:
+• Implement a device node and read() / write() to it. Use ioctl() to manipulate specific setting or retrive specific information.
+• Certain interfaces like semaphores, can be represented as file descriptors and manipulated as such.
+• Add the information as a file to the appropriate location in sysfs.

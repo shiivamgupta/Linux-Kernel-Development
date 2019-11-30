@@ -1,0 +1,159 @@
+• Block devices are hardware devices distinguished by the random access of fixed-size chunks of data. Character devices are accessed as a stream of sequential data, one byte after another. The difference comes down to whether the device accesses data randomly.
+Managing block devices in the kernel requires more care and work than managing character devices. Character devices have only one position - the current one; whereas block devices must be able to navigate back and forth between any location on the media. The kernel doesn't have to provide an entire subsystem to manage character devices, but block devices definitely require that. Another reason is that block devices are quite performance sensitive.
+
+1. Anatomy of a block device:
+The smallest addressable unit on a block device is a sector (hardware view). The smallest logically addressable unit from kernel's point of view is a block. 
+The block size cannot be smaller than sector size and must be a multiple of sector size. The kernel also requires that the block size be no larger than page size. (But this is an artificial constrain that could go away in the future. This constrain just simplifies the kernel.)
+
+2. Buffers and buffer heads:
+When a block is stored in memory - say, after a read or pending write - it is stored in a buffer. Each buffer is associated with exactly 1 block. The buffer serves as the object that represents a disk block in memory. A single page can hold one or more blocks in memory. Each buffer is associated with a descriptor, which is called buffer head and is defined in <linux/buffer_head.h>, of type struct buffer_head:
+===========================================================================
+struct buffer_head{
+	unsigned long b_state;              /* buffer state flags */
+	struct buffer_head* b_this_page;    /* list of page's buffers */
+	struct page* b_page;                /* associated page */
+	sector_t b_blocknr;                 /* starting block number */
+	size_t b_size;                      /* size of mapping */
+	char* b_data;                       /* pointer to data within page */
+	struct block_device* b_bdev;        /* associated block device */
+	bh_end_io_t* b_end_io;              /* I/O completion */
+	void* b_private;                    /* reserved for b_end io */
+	struct list_head b_assoc_buffers;   /* associated mappings */
+	struct address_space* b_assoc_map;  /* associated address space */
+	atomic_t b_count;                   /* use count */
+};
+===========================================================================
+b_state flag specifies the state of this particular buffer, see p292 for more details. Note that bh_state_bits enumeration's last value: BH_PrivateStart flag; it isn't a valid state of buffer, but indicates the first usable bit of which other code can make use. (All bit values equal to or greater than BH_PrivateStart are safe to be used by individual drivers who want to store information in the b_state field.)
+Before manipulating a buffer head, you must increment its reference count via get_bh(); and call put_bh() when finished with the buffer head.
+The physical block on disk to which a given buffer corresponds is the b_blocknr-th logical block on the block device described by b_bdev.
+The physical page in memory to which a given buffers corresponds is the page pointed to by b_page. b_data is a pointer directly to the block that exists somewhere in b_page, which is b_size in size. Therefore, the block is located in memory starting at address b_data and ending at address (b_data + b_size).
+
+The purpose of a buffer head is to describe this mapping between the on-disk block and the physical in-memory buffer (which is a sequence of bytes on a specific page). Acting as a descriptor of this disk_block-to-physical_page mapping is buffer_head's only role in kernel.
+
+buffer_head has two problems:
+i) The buffer head was a large and unwieldy data structure, and kernel prefers to work in terms of pages. ii) The buffer head only describes a single buffer, when used as the container for all I/O operations, the buffer head forces the kernel to break up potentially large block I/O operations into multiple buffer_head structures. This results in needless overhead and space consumption. So 2.5 kernel introduced a new, flexible, and lightweight container for block I/O operations - the bio structure.
+
+3. The bio structure:
+Defined in <linux/bio.h>, bio represents block I/O operations that are in flight(active) as a list of segments. A segment is a chunk of a buffer that is contiguous in memory; thus, individual buffers need not be contiguous in memory. The bio structure provides the capability for the kernel to perform block I/O operations of even a single buffer from multiple locations in memory. (This is called scatter-gather I/O.)
+==========================================================================
+struct bio{
+	sector_t bi_sector;               /* device address in 512-byte sectors, the first 512-byte sector to be transferred for this bio. */
+	struct bio* bi_next;              /* request queue link */
+	struct block_device* b_bdev;      /* associated block device */
+	unsigned long bi_flags;           /* status and command flags */
+	unsigned long bi_rw;              /* read or write? */
+	unsigned short bi_vcnt;           /* number of bio_vecs */
+	unsigned short bi_idx;            /* current index in bi_io_vec */
+	unsigned short bi_phys_segments;  /* number of segments */
+	unsigned int bi_size;             /* size of data to be transferred, in bytes */
+	unsigned int bi_seg_front_size;   /* size of first segment */
+	unsigned int bi_seg_back_size;    /* size of last segment */
+	unsigned int bi_max_vecs;         /* maximum bio vecs possible */
+	unsigned int bi_comp_cpu;         /* completion CPU */
+	atomic_t bi_cnt;                  /* usage count */
+	struct bio_vec* bi_io_vec;        /* bio vec array */
+	bi_end_io_t* bi_end_io;           /* I/O completion method */
+	void* bi_private;                 /* owner-private method */
+	bio_destructor_t* bi_destructor;  /* destructor method */
+	struct bio_vec bi_inline_vecs[0]; /* inline bio vectors */
+};
+==========================================================================
+ ------      ------    ------    ------
+| page |    | page |  | page |  | page | (page structures involved in block I/O operation)
+ ------      ------    ------    ------
+     ^         ^         ^         ^
+     |         |         |         |
+ ---------------------------------------
+| bio_vec | bio_vec | bio_vec | bio_vec | ... (list of bio_vec structures, @bio_vcnt in all.)
+ ---------------------------------------
+^               ^
+|              /  bi_idx
+| bio_io_vec  /
+|            /
+             |
+ -----------/
+|struct bio |
+ -----------
+ Relationship between struct bio, struct bio_vec, and struct page.
+
+ • I/O vectors:
+ The primary purpose of a bio structure is to represent an in-flight block I/O operation. The bio_io_vec field points to an array of bio_vec structures. Each bio_vec is treated as a vector of the form <page, offset, len>, which describes a specific segment: the physical page on which it lies, the location of the block as an offset into the page, and the length of the block starting from the given offset. (The full array of these vectors describes the entire buffer.)
+==========================================================================	
+struct bio_vec{
+	struct page* bv_page;      /* pointer to the physical page on which this buffer resides */
+	unsigned int bv_len;       /* the length in bytes of this buffer */
+	unsigned int bv_offset;    /* the byte offset within the page where the buffer resides */
+};
+==========================================================================
+In summary, each block I/O request is represented by a bio structure. The bi_idx field is used to point to the current bio_vec in the list, which helps the block I/O layer keep track of partially completed block I/O operations.
+The bio structure maintains a use count in the bi_cnt field. 
+void bio_get(struct bio* bio);       /* increases bi_cnt */
+void bio_put(struct bio* bio);       /* decreases bi_cnt, and when it reaches 0, destroy the bio structure */
+
+• The old V.S. the new:
+The difference between buffer head and the new bio structure is important. The bio structure represents an I/O operation, which may include one or more pages in memory. The buffer_head structure represents a single buffer, which describes a single block on the disk. Because buffer_head is tied to a single disk block in a single page, buffer heads results in the unnecessary dividing of requests into block-size chunks, only to later reassemble them. Because bio structure is lightweight, it can describe discontiguous blocks and doesn't unnecessarily split I/O operations.
+Switching from struct buffer_head to struct bio provides the following benefits, also:
+i)   The bio structure can easily represent high memory, because struct bio deals with only physical pages and no direct pointers.
+ii)  The bio structure can represent both normal page I/O and direct I/O (I/O operations that do not go through page cache).
+iii) The bio structure makes it easy to perform scatter-gather block I/O operations, with the data involved in the operation originating from multiple physical pages.
+Currently, the buffer_head is still needed to contain information about buffers, while the bio structure describes in-flight I/O.
+
+4. Request queues:
+Block devices must maintain request queues to store their pending block I/O requests. The request queue is represented by struct request_queue, which is defined in <linux/blkdev.h>. Each item in the queue's request list is a single request, of the type struct request, also defined in <linux/blkdev.h>. Each request can be composed of more than one bio structure.
+
+5. I/O schedulers:
+The kernel doesn't issue block I/O requests to the disk in the order they are received or as soon as they are received. Instead, it performs operations called "merging and sorting" to greatly improve the performance of the system as a whole.
+• The job of an I/O scheduler:
+An I/O scheduler works by managing a block device's request queue. An I/O scheduler, very openly, is unfair to some requests at the expense of improving the overall performance of the system.
+
+i)   The Linus Elevator:
+It was the default I/O scheduler in 2.4 kernel. In summary, when a request is added to the queue, 4 operations are possible. In order, they are:
+• If a request to an adjacent on-disk sector is in the queue, the existing request and the new request merge into a single request.
+• If a request in the queue is sufficiently old, the new request is inserted at the tail of the queue to prevent starvation of the other, older, requests.
+• If a suitable location sector-wise is in the queue, the new request is inserted there. This keeps the queue sorted by physical location on disk.
+• Finally, if no such suitable insertion point exists, the request is inserted at the tail of the queue.
+The linus elevator is implemented in block/elevator.c.
+
+ii)  The deadline I/O scheduler:
+Heavy disk I/O operations to one area of the disk can indefinitely starve request operations to another part of the disk. The worse is if writes starves reads. Write operations could be entirely asynchronous with respect to the submitting application. Read operations are quite different. Normally, when an application submits a read request, the application blocks until the request is fulfilled. That is, read requests occur synchronously with respect to the submitting application. Compounding the problem, read requests tend to be dependent on each other. The deadline I/O scheduler implements several features to ensure that request starvation in general, and read starvation in specific, is minimized.
+Note that reducing request starvation comes at a cost to global throughput. The deadline I/O scheduler, works harder to limit starvation while still providing good global throughput.
+
+In deadline I/O scheduler, each request is associated with an expiration time. By default, the expiration time is 500ms for read requests and 5s for write requests. The deadline I/O scheduler operates similarly to the Linus Elevator in that it maintains a request queue sorted by physical location on disk. This queue is called sorted queue. When a new request is submitted to the sorted queue, the deadline I/O scheduler performs merging and sorting like the Linus Elevator. The deadline I/O scheduler also, however, inserts the request into a second queue that depends on the type of request. Read requests are sorted into a special read FIFO queue, and write requests are sorted into a special write FIFO queue. The normal queue is sorted by on-disk sector, the read FIFO and write FIFO queue is sorted by the time, kept FIFO. 
+Under normal operation, the deadline I/O scheduler pulls requests from the head of the sorted queue into the dispatch queue, the dispatch queue is then fed to the disk drive. If the request at the head of either the write FIFO queue or the read FIFO queue expires, the deadline I/O scheduler then begins servicing requests from the FIFO queue. In this manner, the deadline I/O scheduler attempts to ensure that no request is outstanding longer than its expiration time.
+And because read requests are given a substantially smaller expiration value than write requests, the deadline I/O scheduler also works to ensure that write requests do not starve read requests. This preference toward read requests provides minimized read latency. The source code is in block/deadline-iosched.c.
+ -----------------
+| read FIFO queue | 
+ -----------------  ------
+                          \
+ ------------------             ----------------
+| write FIFO queue | ------>   | dispatch queue |  -----> DISK
+ ------------------        ^    ----------------
+                         --/
+  --------------        /
+ | sorted queue |  -----
+  --------------
+The 3 queues of the deadline I/O scheduler.
+
+iii) The Anticipatory I/O scheduler:
+Although the deadline I/O scheduler does a great job in minimizing read latency, it does so at the expense of global throughput. The anticipatory I/O scheduler aims to continue to provide excellent read latency, but also provide excellent global throughput. The major change is the addition of an anticipation heuristic.
+When a read request is issued, it is handled as usual, within its expiration time. After the request is submitted, however, the anticipatory I/O scheduler doesn't immediately seek back and return to handling other requests. Instead, it does absolutely nothing for a few milliseconds (the default value is 6 milliseconds.) In those milliseconds, there is a good chance that the application will submit another read request. After the waiting period elapses, the anticipatory I/O scheduler seeks back to where it left off and continues handling the previous requests.
+As more and more reads are issued to the same area of disk, many more seeks are prevented. And of course if no activity occurs within the waiting period, the anticipatory I/O scheduler loses and a few milliseconds are wasted. The anticipatory I/O scheduler keeps track of per-process statistics pertaining to block I/O habits in hopes of correctly anticipating the actions of applications. 
+The source code is in block/as-iosched.c. It is ideal for servers, although it performs poorly on certain uncommon but critical workloads involving seek-happy databases.
+
+iv)  The complete fair queueing I/O scheduler:
+The CFQ I/O scheduler assigns incoming I/O requests to specific queues based on the process originating the I/O request. Within each queue, requests are coalesced with adjacent requests and insertion sorted. The difference with CFQ I/O scheduler is that there's one queue for each process submitting I/O. CFQ then services the queue round robin, plucking a configurable number of requests from each queue before continuing on to the next.
+This provides fairness at a per-process level, assuring that each process receives a fair slice of the disk's bandwidth. The intended workload is multimedia, but in practice the CFQ I/O scheduler performs well in many scenarios.
+The source code lives in block/cfq-iosched.c. It is recommended for desktop workloads, although it performs reasonably well in nearly all workloads without any pathological corner cases. It is now the default I/O scheduler in linux.
+
+v)   The noop I/O scheduler:
+The noop scheduler does not perform sorting or any other form of seek-prevention work. (In turn, it has no need to implement anything akin to minimize request latency in the previous schedulers.) But the noop I/O scheduler does perform merging as its only chore. Other than this operation, noop I/O scheduler truly is a noop, merely maintaining the request queue in near-FIFO order.
+This scheduler is intended for block devices that are truly random-access, such as flash memory cards. If a block device has little or no overhead associated with "seeking", there's no need for insertion sorting of incoming requests, and the noop I/O scheduler is the ideal candidate.
+The source code is in block/noop-iosched.c. It is intended only for real random-access devices.
+
+6. I/O scheduler selection:
+By default, block devices use the CFQ I/O scheduler. This can be overriden via the boot-time option "elevator=foo" on the kernel command line, where foo is valid and enabled I/O scheduler:
+Parameter           I/O scheduler:
+as                  Anticipatory
+cfq                 Complete Fair Queueing
+deadline            Deadline
+noop                Noop
