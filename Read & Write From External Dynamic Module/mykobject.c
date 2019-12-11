@@ -5,7 +5,7 @@
 #include <linux/init.h>
 //#include <linux/stdlib.h>
 
-static char baz[20]="Rahul";
+static char baz[20]="Shivam";
 static int foo=555;
 //static int baz;
 //static char baz[32]="Nivedita";
@@ -110,5 +110,5 @@ static void __exit example_exit(void)
 
 module_init(example_init);
 module_exit(example_exit);
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Greg Kroah-Hartman <greg@kroah.com>");
+MODULE_LICENSE("SHIVAM");
+MODULE_AUTHOR("Shivam Gupta <shivamshankargupta@gmail.com>");
